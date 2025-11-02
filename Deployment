@@ -2,3 +2,13 @@ aws cloudformation deploy \
   --template-file template.yaml \
   --stack-name iam-guardian \
   --capabilities CAPABILITY_NAMED_IAM
+
+---CloudFormation will:---
+
+Create an IAM Role with permissions for Access Analyzer and IAM operations.
+
+Create a Lambda Function using your lambda_function.py file.
+
+Create an EventBridge Rule (IAMGuardianScheduleRule) that automatically triggers the Lambda every 24 hours.
+
+Create the necessary Lambda permissions so EventBridge can invoke it.
