@@ -1,0 +1,4 @@
+aws cloudformation deploy \
+  --template-file template.yaml \
+  --stack-name iam-guardian \
+  --capabilities CAPABILITY_NAMED_IAM
