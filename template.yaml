@@ -1,0 +1,508 @@
+# Automated IAM Guardian — Project Files
+
+This canvas contains the three main files for the project:
+
+* `template.yaml` — CloudFormation template that creates the SNS topic, Lambda, IAM role and EventBridge schedule.
+* `lambda_function.py` — Python 3.11 Lambda handler that calls IAM Access Analyzer to generate a least-privilege policy and swaps the role's policy.
+* `README.md` — Usage, deployment, testing and cleanup instructions.
+
+---
+
+## template.yaml
+
+```yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Automated IAM Guardian — CloudFormation template. Creates a Lambda that
+  uses IAM Access Analyzer to generate least-privilege policies and swaps
+  an overly permissive policy for a generated customer-managed policy.
+
+Parameters:
+  TargetRoleArn:
+    Type: String
+    Description: ARN of the IAM Role to analyze (e.g., arn:aws:iam::123456789012:role/MyAppRole)
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive SNS notifications (will require confirmation)
+  PowerUserPolicyArn:
+    Type: String
+    Default: arn:aws:iam::aws:policy/PowerUserAccess
+    Description: The ARN of the permissive policy to detach from the target role (hardcoded default)
+
+Resources:
+  IAMGuardianNotifications:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: IAMGuardianNotifications
+
+  IAMGuardianSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref IAMGuardianNotifications
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  IAMGuardianLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: IAMGuardianLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: IAMGuardianInlinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+              - Effect: Allow
+                Action:
+                  - access-analyzer:StartPolicyGeneration
+                  - access-analyzer:GetGeneratedPolicy
+                  - access-analyzer:ListPolicyGenerations
+                  - access-analyzer:CancelPolicyGeneration
+                Resource: '*'
+
+              - Effect: Allow
+                Action:
+                  - iam:CreatePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListAttachedRolePolicies
+                  - iam:GetRole
+                  - iam:TagPolicy
+                  - iam:GetPolicy
+                  - iam:ListPolicies
+                Resource: '*'
+
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref IAMGuardianNotifications
+
+              - Effect: Allow
+                Action:
+                  - cloudtrail:LookupEvents
+                Resource: '*'
+
+  IAMGuardianFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: IAMGuardianFunction
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt IAMGuardianLambdaRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          TARGET_ROLE_ARN: !Ref TargetRoleArn
+          POWERUSER_POLICY_ARN: !Ref PowerUserPolicyArn
+          SNS_TOPIC_ARN: !Ref IAMGuardianNotifications
+      Code:
+        ZipFile: |
+          # lambda_function.py - Inline in CloudFormation for convenience
+          import os
+          import time
+          import json
+          import logging
+          import datetime
+          import boto3
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          accessanalyzer = boto3.client('accessanalyzer')
+          iam = boto3.client('iam')
+          sns = boto3.client('sns')
+
+          TARGET_ROLE_ARN = os.environ.get('TARGET_ROLE_ARN')
+          POWERUSER_POLICY_ARN = os.environ.get('POWERUSER_POLICY_ARN', 'arn:aws:iam::aws:policy/PowerUserAccess')
+          SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
+
+          def arn_to_role_name(role_arn):
+              # ARN format: arn:aws:iam::123456789012:role/RoleName
+              try:
+                  return role_arn.split(':role/')[1]
+              except Exception:
+                  raise ValueError(f'Invalid role ARN: {role_arn}')
+
+          def publish(subject, message):
+              if not SNS_TOPIC_ARN:
+                  logger.warning('SNS_TOPIC_ARN not set; skipping publish')
+                  return
+              try:
+                  sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject, Message=message)
+              except ClientError as e:
+                  logger.exception('Failed to publish SNS message: %s', e)
+
+          def lambda_handler(event, context):
+              now = datetime.datetime.utcnow().strftime('%Y-%m-%d')
+              logger.info('Starting IAM Guardian run for target: %s', TARGET_ROLE_ARN)
+
+              if not TARGET_ROLE_ARN:
+                  msg = 'TARGET_ROLE_ARN environment variable is required.'
+                  logger.error(msg)
+                  publish('IAM Guardian - Error', msg)
+                  return {'status': 'error', 'message': msg}
+
+              try:
+                  role_name = arn_to_role_name(TARGET_ROLE_ARN)
+              except ValueError as e:
+                  publish('IAM Guardian - Error', str(e))
+                  return {'status': 'error', 'message': str(e)}
+
+              # Start policy generation for the role analyzing CloudTrail for last 7 days
+              try:
+                  end_time = datetime.datetime.utcnow()
+                  start_time = end_time - datetime.timedelta(days=7)
+
+                  policy_gen_request = {
+                      'policyGenerationDetails': {
+                          'principalArn': TARGET_ROLE_ARN
+                      },
+                      'cloudTrailDetails': {
+                          'startTime': start_time.isoformat() + 'Z',
+                          'endTime': end_time.isoformat() + 'Z'
+                      }
+                  }
+
+                  logger.info('Starting policy generation job: %s', policy_gen_request)
+                  resp = accessanalyzer.start_policy_generation(
+                      policyGenerationDetails={'principalArn': TARGET_ROLE_ARN},
+                      cloudTrailDetails={'startTime': start_time.isoformat() + 'Z', 'endTime': end_time.isoformat() + 'Z'}
+                  )
+                  job_id = resp.get('jobId')
+                  logger.info('Policy generation started. JobId: %s', job_id)
+
+              except ClientError as e:
+                  msg = f'Failed to start policy generation: {e}'
+                  logger.exception(msg)
+                  publish('IAM Guardian - Error', msg)
+                  return {'status': 'error', 'message': msg}
+
+              # Poll for job completion
+              try:
+                  for _ in range(60):  # up to ~5 minutes with 5s sleep; adjust as needed
+                      time.sleep(5)
+                      details = accessanalyzer.get_generated_policy(jobId=job_id)
+                      job_details = details.get('jobDetails', {})
+                      status = job_details.get('status')
+                      logger.info('Job %s status: %s', job_id, status)
+                      if status in ('COMPLETED', 'FAILED', 'TIMED_OUT', 'CANCELLED'):
+                          break
+
+                  if status != 'COMPLETED':
+                      msg = f'Policy generation did not complete successfully. Status: {status} JobDetails: {json.dumps(job_details)}'
+                      logger.error(msg)
+                      publish('IAM Guardian - Error', msg)
+                      return {'status': 'error', 'message': msg}
+
+                  generated = job_details.get('generatedPolicies', [])
+                  if not generated:
+                      msg = 'No generated policy returned by Access Analyzer.'
+                      logger.error(msg)
+                      publish('IAM Guardian - Error', msg)
+                      return {'status': 'error', 'message': msg}
+
+                  # Access the first generated policy document
+                  policy_doc = generated[0].get('policy', {})
+                  policy_json = json.dumps(policy_doc, indent=2)
+
+                  # Create a managed policy
+                  policy_name = f'LeastPrivilegePolicy-For-{role_name}-{now}'
+                  create_resp = iam.create_policy(
+                      PolicyName=policy_name,
+                      PolicyDocument=policy_json,
+                      Description=f'Least-privilege policy generated for {TARGET_ROLE_ARN} on {now}',
+                      Tags=[{'Key': 'CreatedBy', 'Value': 'IAMGuardian'}]
+                  )
+                  new_policy_arn = create_resp['Policy']['Arn']
+                  logger.info('Created new policy: %s', new_policy_arn)
+
+                  # Detach the hardcoded permissive policy from the role (for safety use provided ARN)
+                  try:
+                      iam.detach_role_policy(RoleName=role_name, PolicyArn=POWERUSER_POLICY_ARN)
+                      logger.info('Detached permissive policy %s from role %s', POWERUSER_POLICY_ARN, role_name)
+                  except ClientError as e:
+                      # Log but continue — maybe the policy wasn't attached
+                      logger.warning('Could not detach policy %s from %s: %s', POWERUSER_POLICY_ARN, role_name, e)
+
+                  # Attach the new policy
+                  iam.attach_role_policy(RoleName=role_name, PolicyArn=new_policy_arn)
+                  logger.info('Attached new least-privilege policy to role %s', role_name)
+
+                  msg = f'Successfully generated and attached policy. Role: {TARGET_ROLE_ARN}\nNewPolicyArn: {new_policy_arn}\nDetached: {POWERUSER_POLICY_ARN}'
+                  publish('IAM Guardian - Success', msg)
+                  return {'status': 'success', 'new_policy_arn': new_policy_arn}
+
+              except ClientError as e:
+                  msg = f'Error while processing job {job_id}: {e}'
+                  logger.exception(msg)
+                  publish('IAM Guardian - Error', msg)
+                  return {'status': 'error', 'message': msg}
+
+```
+
+IAMGuardianEventRule:
+Type: AWS::Events::Rule
+Properties:
+Name: WeeklyAnalysisTrigger
+ScheduleExpression: 'cron(0 2 ? * SUN *)' # Every Sunday at 02:00 UTC
+State: ENABLED
+Targets:
+- Arn: !GetAtt IAMGuardianFunction.Arn
+Id: IAMGuardianFunctionTarget
+
+PermissionForEventsToInvokeLambda:
+Type: AWS::Lambda::Permission
+Properties:
+FunctionName: !Ref IAMGuardianFunction
+Action: lambda:InvokeFunction
+Principal: events.amazonaws.com
+SourceArn: !GetAtt IAMGuardianEventRule.Arn
+
+Outputs:
+LambdaFunctionName:
+Description: Name of the IAM Guardian Lambda function
+Value: !Ref IAMGuardianFunction
+
+SNSTopicArn:
+Description: SNS Topic for notifications
+Value: !Ref IAMGuardianNotifications
+
+EventRuleName:
+Description: The EventBridge rule that triggers weekly
+Value: !Ref IAMGuardianEventRule
+
+````
+
+---
+
+## lambda_function.py
+
+```python
+"""
+Lambda function `lambda_function.py` (same logic as in template but formatted for local testing)
+Python 3.11
+"""
+import os
+import time
+import json
+import logging
+import datetime
+import boto3
+from botocore.exceptions import ClientError
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+accessanalyzer = boto3.client('accessanalyzer')
+iam = boto3.client('iam')
+sns = boto3.client('sns')
+
+TARGET_ROLE_ARN = os.environ.get('TARGET_ROLE_ARN')
+POWERUSER_POLICY_ARN = os.environ.get('POWERUSER_POLICY_ARN', 'arn:aws:iam::aws:policy/PowerUserAccess')
+SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
+
+
+def arn_to_role_name(role_arn):
+    try:
+        return role_arn.split(':role/')[1]
+    except Exception:
+        raise ValueError(f'Invalid role ARN: {role_arn}')
+
+
+def publish(subject, message):
+    if not SNS_TOPIC_ARN:
+        logger.warning('SNS_TOPIC_ARN not set; skipping publish')
+        return
+    try:
+        sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject, Message=message)
+    except ClientError as e:
+        logger.exception('Failed to publish SNS message: %s', e)
+
+
+def lambda_handler(event, context):
+    now = datetime.datetime.utcnow().strftime('%Y-%m-%d')
+    logger.info('Starting IAM Guardian run for target: %s', TARGET_ROLE_ARN)
+
+    if not TARGET_ROLE_ARN:
+        msg = 'TARGET_ROLE_ARN environment variable is required.'
+        logger.error(msg)
+        publish('IAM Guardian - Error', msg)
+        return {'status': 'error', 'message': msg}
+
+    try:
+        role_name = arn_to_role_name(TARGET_ROLE_ARN)
+    except ValueError as e:
+        publish('IAM Guardian - Error', str(e))
+        return {'status': 'error', 'message': str(e)}
+
+    try:
+        end_time = datetime.datetime.utcnow()
+        start_time = end_time - datetime.timedelta(days=7)
+
+        resp = accessanalyzer.start_policy_generation(
+            policyGenerationDetails={'principalArn': TARGET_ROLE_ARN},
+            cloudTrailDetails={'startTime': start_time.isoformat() + 'Z', 'endTime': end_time.isoformat() + 'Z'}
+        )
+        job_id = resp.get('jobId')
+        logger.info('Policy generation started. JobId: %s', job_id)
+
+    except ClientError as e:
+        msg = f'Failed to start policy generation: {e}'
+        logger.exception(msg)
+        publish('IAM Guardian - Error', msg)
+        return {'status': 'error', 'message': msg}
+
+    try:
+        for _ in range(60):
+            time.sleep(5)
+            details = accessanalyzer.get_generated_policy(jobId=job_id)
+            job_details = details.get('jobDetails', {})
+            status = job_details.get('status')
+            logger.info('Job %s status: %s', job_id, status)
+            if status in ('COMPLETED', 'FAILED', 'TIMED_OUT', 'CANCELLED'):
+                break
+
+        if status != 'COMPLETED':
+            msg = f'Policy generation did not complete successfully. Status: {status} JobDetails: {json.dumps(job_details)}'
+            logger.error(msg)
+            publish('IAM Guardian - Error', msg)
+            return {'status': 'error', 'message': msg}
+
+        generated = job_details.get('generatedPolicies', [])
+        if not generated:
+            msg = 'No generated policy returned by Access Analyzer.'
+            logger.error(msg)
+            publish('IAM Guardian - Error', msg)
+            return {'status': 'error', 'message': msg}
+
+        policy_doc = generated[0].get('policy', {})
+        policy_json = json.dumps(policy_doc)
+
+        policy_name = f'LeastPrivilegePolicy-For-{role_name}-{now}'
+        create_resp = iam.create_policy(
+            PolicyName=policy_name,
+            PolicyDocument=policy_json,
+            Description=f'Least-privilege policy generated for {TARGET_ROLE_ARN} on {now}',
+            Tags=[{'Key': 'CreatedBy', 'Value': 'IAMGuardian'}]
+        )
+        new_policy_arn = create_resp['Policy']['Arn']
+        logger.info('Created new policy: %s', new_policy_arn)
+
+        try:
+            iam.detach_role_policy(RoleName=role_name, PolicyArn=POWERUSER_POLICY_ARN)
+            logger.info('Detached permissive policy %s from role %s', POWERUSER_POLICY_ARN, role_name)
+        except ClientError as e:
+            logger.warning('Could not detach policy %s from %s: %s', POWERUSER_POLICY_ARN, role_name, e)
+
+        iam.attach_role_policy(RoleName=role_name, PolicyArn=new_policy_arn)
+        logger.info('Attached new least-privilege policy to role %s', role_name)
+
+        msg = f'Successfully generated and attached policy. Role: {TARGET_ROLE_ARN}\nNewPolicyArn: {new_policy_arn}\nDetached: {POWERUSER_POLICY_ARN}'
+        publish('IAM Guardian - Success', msg)
+        return {'status': 'success', 'new_policy_arn': new_policy_arn}
+
+    except ClientError as e:
+        msg = f'Error while processing job {job_id}: {e}'
+        logger.exception(msg)
+        publish('IAM Guardian - Error', msg)
+        return {'status': 'error', 'message': msg}
+````
+
+---
+
+## README.md
+
+````markdown
+# Automated IAM Guardian — README
+
+## Project Purpose
+Automated IAM Guardian is a serverless pipeline that enforces least privilege by using IAM Access Analyzer to generate a fine-grained IAM policy for a target role based on its CloudTrail activity, then replaces a pre-existing overly-permissive policy (e.g., `PowerUserAccess`) with the generated policy.
+
+This project is ideal for portfolio/demo use because it automates a real security control that many organizations miss: periodic privilege-tightening based on real usage.
+
+## Architecture
+- EventBridge scheduled rule (weekly)
+- Lambda function (Python 3.11) that calls IAM Access Analyzer
+- SNS topic for notifications
+- IAM role for the Lambda with least-privilege permissions required to run the workflow
+
+## Prerequisites
+- An AWS account with permissions to create CloudFormation stacks, Lambda, IAM roles/policies, EventBridge and SNS.
+- AWS CLI configured (`aws configure`) or access to the AWS Console.
+- (Optional) AWS SAM or CDK if you prefer to adapt this template.
+
+## Deployment
+1. Save `template.yaml` locally.
+2. Deploy using AWS CLI (example):
+
+```bash
+aws cloudformation deploy \
+  --template-file template.yaml \
+  --stack-name IAMGuardianStack \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides TargetRoleArn=arn:aws:iam::123456789012:role/MyAppRole NotificationEmail=your-email@example.com
+````
+
+3. You will receive a confirmation email — accept the SNS subscription.
+
+## Parameters
+
+* `TargetRoleArn` — ARN of the role you want to analyze.
+* `NotificationEmail` — email to receive success/failure messages.
+* `PowerUserPolicyArn` — (optional) ARN of the permissive policy to detach. Defaults to `arn:aws:iam::aws:policy/PowerUserAccess`.
+
+## How It Works / How to Test
+
+* After deployment, the EventBridge rule will invoke the Lambda weekly. To test immediately:
+
+  * Manually invoke the Lambda from the console and pass an empty event. The function reads `TARGET_ROLE_ARN` from its environment.
+  * Or use the AWS CLI to invoke the function (you may need to adapt the function name):
+
+```bash
+aws lambda invoke --function-name IAMGuardianFunction out.json
+cat out.json
+```
+
+* Check the SNS email for notifications and the CloudWatch Logs for detailed traces.
+
+## Safety Notes
+
+* The template detaches the supplied permissive policy (default: PowerUserAccess) from the target role. This is **intentional** but high-impact — ensure the role is not required for immediate production operations or be ready to rollback.
+* Consider testing initially in a development account or with a non-critical role.
+
+## Cleanup
+
+Remove the CloudFormation stack to delete all resources created by this template:
+
+```bash
+aws cloudformation delete-stack --stack-name IAMGuardianStack
+```
+
+## Extending the Project
+
+* Add a manual approval step (SNS -> Lambda -> Approver -> Confirm) before detaching/applying the new policy.
+* Add policy diffing and a Git-backed policy store for auditability.
+* Use Terraform instead of CloudFormation for infra if you prefer.
+
+```
+
+---
+
+*End of files.*
+
+```
